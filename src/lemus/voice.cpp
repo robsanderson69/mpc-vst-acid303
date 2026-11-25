@@ -232,7 +232,7 @@ struct HighPass {
 	double b() const { return -s * ga; }
 	double process(double x)
 	{
-		const double v = (x - s) * g / (1 + g);
+		const double v = (x - s) * g * ga; // ga = 1/(1+g), precomputed in set()
 		const double lp = v + s;
 		s = lp + v;
 		return x - lp;
@@ -809,7 +809,7 @@ struct Voice::Impl {
 			rampTune = tuneOct;
 			rampScale = cal.vcoScale;
 			rampCents = cal.tuneCents;
-			const double f = 110.0 * std::pow(2.0, (vCv - 2.75) * cal.vcoScale + tuneOct + cal.tuneCents / 1200);
+			const double f = 110.0 * fastExp(((vCv - 2.75) * cal.vcoScale + tuneOct + cal.tuneCents / 1200) * 0.69314718055994530942); // 2^x; the pow reruns every VCO sample during a slide
 			ramp = std::max(1 / f - kResetSec, 8 * hv);
 			vcoHz = 1 / (ramp + kResetSec);
 			dphi = hv / ramp;
@@ -984,21 +984,25 @@ struct Voice::Impl {
 			const double m32 = 0.0 - hh * j32;
 			double m11 = 1.0 - hh * j11, m22 = 1.0 - hh * j22, m33 = 1.0 - hh * j33;
 			double d[4] = {-F[0], -F[1], -F[2], -F[3]};
-			const double e1 = m10 / m00;
+			// One reciprocal per pivot, reused by the elimination and the back substitution.
+			const double r00 = 1.0 / m00;
+			const double e1 = m10 * r00;
 			m11 -= e1 * m01;
 			const double m13 = 0.0 - e1 * m03;
 			d[1] -= e1 * d[0];
-			const double e2 = m21 / m11;
+			const double r11 = 1.0 / m11;
+			const double e2 = m21 * r11;
 			m22 -= e2 * m12;
 			const double m23f = m23 - e2 * m13;
 			d[2] -= e2 * d[1];
-			const double e3 = m32 / m22;
+			const double r22 = 1.0 / m22;
+			const double e3 = m32 * r22;
 			m33 -= e3 * m23f;
 			d[3] -= e3 * d[2];
 			d[3] = d[3] / m33;
-			d[2] = (d[2] - m23f * d[3]) / m22;
-			d[1] = (d[1] - m12 * d[2] - m13 * d[3]) / m11;
-			d[0] = (d[0] - m01 * d[1] - m03 * d[3]) / m00;
+			d[2] = (d[2] - m23f * d[3]) * r22;
+			d[1] = (d[1] - m12 * d[2] - m13 * d[3]) * r11;
+			d[0] = (d[0] - m01 * d[1] - m03 * d[3]) * r00;
 			double mx = 0;
 			for (int i = 0; i < 4; ++i) {
 				un[i] += std::clamp(d[i], -0.1, 0.1);
