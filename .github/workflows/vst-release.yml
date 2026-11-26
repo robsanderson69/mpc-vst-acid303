@@ -29,5 +29,5 @@ jobs:
       host_test: '"$MPC_VST/tools/test_port.sh" vst/vst.json'
       plugin_id: acid-303
       license: AGPL-3.0-only
-      about: A TB-303 circuit-model bass synth with switchable Devil Fish mods (voice from Lemus).
+      about: A TB-303 circuit-model bass synth (voice from Lemus).
       dry_run: ${{ inputs.dry_run }}

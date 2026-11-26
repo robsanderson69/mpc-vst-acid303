@@ -5,11 +5,21 @@ not a filter-and-oscillator imitation: every stage of the original (the oscillat
 four-capacitor transistor ladder filter and its resonance loop, the envelopes, accent sweep, slide and VCA) is
 solved as a circuit, transistor by transistor, from Roland's service-notes schematic. The component values are
 fitted to a real unit, so it is matched to the hardware: 3.0 dB average spectral distance from 400 recorded notes,
-against 2.2-2.5 dB between a real 303's own retakes. It also has the full set of **Devil Fish** mods, which you
-can switch in or out.
+against 2.2-2.5 dB between a real 303's own retakes.
+
+> **This branch (`lite-no-devilfish`) is the CPU-lean variant.** The Devil Fish mods and their tab are removed
+> (the plugin is the plain TB-303: one page, ten parameters), and three things are cheaper to compute:
+> the BA662 VCA's tanh is a single-value rational approximation (max error 3e-7, -130 dB), the saw's VCO runs at
+> 176.4/192 kHz instead of 352.8/384 (`Impl::kSawHalfRate`; the square keeps the full rate because its edges alias),
+> and a few divisions in the ladder solve and high-pass filters are gone. Measured against the previous code with
+> the voice tests: the Devil Fish removal and the tanh change are inaudible (differences below -125 dBFS; every
+> test pattern null-tests to bit-identical with the tanh swapped back); the half-rate saw is the one change that
+> moves the sound: mean spectral distance to the original Lemus renders rises from 0.007-0.04 dB to 0.014-0.09 dB
+> (largest frame 0.1-1.8 dB at extreme resonance with the filter wide open); the inharmonic-energy test is
+> unchanged or slightly better. About 11-12% less CPU on a desktop x86 run (ECO 7.6% -> 6.7% of a core, HQ
+> 10.5% -> 9.3%); not measured on MPC hardware.
 
 ![303 tab, on a Force](docs/device-303.png)
-![Devil Fish tab, on a Force](docs/device-devil-fish.png)
 
 ## Where it comes from
 

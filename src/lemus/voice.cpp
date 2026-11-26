@@ -241,38 +241,26 @@ struct HighPass {
 };
 } // namespace
 
+// tanh for a single value, as a [4/4] rational function of x^2 fitted to tanh on |x| <= 6 (float
+// arithmetic: max error 3e-7, about -130 dB, the same order as tanh4's float exp). Beyond 6 it
+// holds tanh(6) (1.2e-5 low), which the BA662 stage never reaches: its input is VCF OUT / 100.
+// Eight multiply-adds and one divide, against tanh4's four lanes of exp and reciprocal for one.
+inline float tanhRat(float x)
+{
+	x = std::clamp(x, -6.0f, 6.0f);
+	const float x2 = x * x;
+	const float num = 0.999999588745817f + x2 * (0.13033509171271296f + x2 * (0.0030706624700176577f + x2 * 1.2840365748679553e-05f));
+	const float den = 1.0f + x2 * (0.4636672316335115f + x2 * (0.024294231624314787f + x2 * (0.000256211379701747f + x2 * 2.940815341091823e-07f)));
+	return x * num / den;
+}
+
 struct Voice::Impl {
 	// ------------------------------------------------------------------ constants
 	double fs = 176400, h = 1 / 176400.0; // internal rate
 	double fsv = 352800, hv = 1 / 352800.0; // VCO rate: 352.8/384 kHz, 2x or 4x the internal rate
-	int vcoRatio = 2;
+	int vcoRatio = 2;       // VCO samples per internal sample in use now (vcoRatioFull, or the half in saw mode)
 	double vcaK1 = 0, vcaK2 = 0, vcaHc = 0; // vcaStep's series R-C branches (setRates)
-	double vcaK1df = 0, vcaK2df = 0, vcaHcDf = 0; // the same with the Devil Fish's 47 nF (bass)
 
-	// Devil Fish state (Controls::devilFish).
-	bool df = false;
-	double fbMul = 1;        // VCF feedback: x2 with the high-resonance switch
-	double gateDf = 0;       // GATE_INT as the Devil Fish's gate stage shapes it
-	double fmHp = 0, fmPrev = 0, fmSig = 0; // Filter FM: the VCA output, AC coupled (~5 Hz)
-	double mufLp = 0;        // muffler's low-pass state
-	double subLevel = 0;     // sub oscillator amplitude (V)
-	double subHeld = 0;      // its band-limited output (one VCO sample delayed, as the saw)
-	bool subHigh = false;
-	double subOut = 0;       // this VCO sample's sub oscillator (sawStep)
-	// Sub oscillator amplitude for LEVEL low/mid/high: a quarter, a half and the whole of the
-	// saw's half swing.
-	static double subVolts(int level) { return level <= 0 ? 0.0 : (kSawTop - kSawBottom) / 2 * (level == 1 ? 0.25 : level == 2 ? 0.5 : 1.0); }
-
-	// Muffler (Devil Fish/TD-3-MO): soft clipping of the VCA output, then a low-pass.
-	double muffler(double v, int mode)
-	{
-		const double lim = mode == 1 ? 2.0 : 1.0;
-		const double y = lim * fastTanh(v / lim);
-		const double a = mode == 1 ? mufA1 : mufA2;
-		mufLp += a * (y - mufLp);
-		return mufLp;
-	}
-	double mufA1 = 0, mufA2 = 0;
 	bool warpOn = getenv("TB_WARP") ? atoi(getenv("TB_WARP")) != 0 : true;
 	double fsc = 44100, hc = 1 / 44100.0;   // control rate (host), and the current control step (s)
 	double sqTol = getenv("TB_SQTOL") ? atof(getenv("TB_SQTOL")) : 1e-2; // a step this small leaves ~1e-5 V (quadratic)
@@ -302,7 +290,15 @@ struct Voice::Impl {
 	double c17 = 0; // VCF input coupling state (C17), relative to the bias node
 
 	// 2x -> 1x half-band for the VCO output
-	Decimator vcoDown;
+	// Cheaper oscillator path: the saw is clean (polyBLEP, inharmonic energy no higher in tbtest alias)
+	// at half the VCO rate, so with SAW selected the VCO runs at 176.4/192 kHz instead of 352.8/384.
+	// The Q8 square shaper's edges are not (they alias below 352.8 kHz, see setRates), so SQUARE
+	// keeps the full rate. Set false to run the saw at the full rate as well.
+	static constexpr bool kSawHalfRate = true;
+	Decimator vcoDownFull, vcoDownHalf;
+	Decimator *vcoDown = &vcoDownFull;
+	int vcoRatioFull = 2, vcoRatioHalf = 1, vcoDelayLenFull = 48, vcoDelayLenHalf = 24;
+	bool vcoHalf = false;
 	float vcoBuf[4] = {};
 	// vcoDown is a short half-band (8 odd taps a side: flat to 0.001 dB at 60 kHz, > 100 dB down
 	// where images would fold below 24 kHz); this delay line puts back the time the original
@@ -320,6 +316,25 @@ struct Voice::Impl {
 		if (++vcoDelayPos == vcoDelayLen)
 			vcoDelayPos = 0;
 		return y;
+	}
+
+	// Switch the VCO between the full-rate and the half-rate path (no allocation: both decimators are
+	// prepared in setRates). Only the short VCO filter and delay line start empty.
+	void useVco(bool half)
+	{
+		half = half && kSawHalfRate && vcoRatioHalf >= 1;
+		if (half == vcoHalf)
+			return;
+		vcoHalf = half;
+		vcoRatio = half ? vcoRatioHalf : vcoRatioFull;
+		fsv = vcoRatio * fs;
+		hv = 1 / fsv;
+		vcoDown = half ? &vcoDownHalf : &vcoDownFull;
+		vcoDown->reset();
+		vcoDelayLen = half ? vcoDelayLenHalf : vcoDelayLenFull;
+		std::fill(std::begin(vcoDelay), std::end(vcoDelay), 0.0f);
+		vcoDelayPos = 0;
+		rampCv = -1e9; // the ramp step depends on hv
 	}
 
 	// ------------------------------------------------------------------ VCF (§4)
@@ -364,7 +379,7 @@ struct Voice::Impl {
 	double sweepWiper = 3.27;
 	// VEG (§6.2)
 	double c42 = 11.5, iVeg = 0;
-	double vegR = 1.5e6, vegTarget = kV12; // what recharges C42 (R123 to the rail; the Devil Fish's DECAY)
+	double vegR = 1.5e6, vegTarget = kV12; // what recharges C42 (R123 to the rail)
 	double iE31 = 0, iB31 = 0, q31Ve = 0.6, vdD35 = 0.5; // Q31: emitter and base currents, V_E
 	double iAbcPrev = 0, iAbcNow = 0;
 	// cutoff / expo (§4.5)
@@ -407,34 +422,42 @@ struct Voice::Impl {
 	{
 		fs = internal;
 		h = 1 / fs;
-		// The VCO stays at 352.8/384 kHz whatever the internal rate: the square shaper's edges
-		// alias audibly below that (tbtest alias).
-		vcoRatio = fs < 150e3 ? 4 : 2;
+		// The square shaper's VCO stays at 352.8/384 kHz whatever the internal rate: its edges alias
+		// audibly below that (tbtest alias). The saw's runs at half that (useVco).
+		vcoRatioFull = fs < 150e3 ? 4 : 2;
+		vcoRatioHalf = vcoRatioFull / 2;
+		vcoRatio = vcoRatioFull;
+		vcoHalf = false;
+		vcoDown = &vcoDownFull;
 		fsv = vcoRatio * fs;
 		hv = 1 / fsv;
 		fsc = host;
 		hc = 1 / fsc;
 		// At 4x, the first stage (to 176.4/192 kHz) only has to stop what would fold below 20 kHz
 		// (172-192 kHz): 4 taps a side are 70 dB down there, on harmonics already 65 dB down.
-		vcoDown.setStages(vcoRatio == 4 ? 2 : 1, kVcoTaps, 4);
-		vcoDelayLen = std::clamp(int(std::lround((63.0 / 384e3 - vcoDown.latency() / fs) * fsv)), 0, kVcoDelayMax);
+		const auto stagesFor = [](int ratio) { return ratio == 4 ? 2 : ratio == 2 ? 1 : 0; };
+		const auto delayFor = [&](const Decimator &d, double vcoRate) {
+			return std::clamp(int(std::lround((63.0 / 384e3 - d.latency() / fs) * vcoRate)), 0, kVcoDelayMax);
+		};
+		vcoDownFull.setStages(stagesFor(vcoRatioFull), kVcoTaps, 4);
+		vcoDownHalf.setStages(stagesFor(vcoRatioHalf), kVcoTaps, 4);
+		vcoDelayLenFull = delayFor(vcoDownFull, fsv);
+		// Timing: the half-rate saw lands 3 half-rate samples (~17 us) later than the full-rate one
+		// with the formula's delay, measured against the full-rate path (tools/voicetest/tbtest
+		// check, the filter-phase fit in docs); the trim lines them up again.
+		vcoDelayLenHalf = std::max(0, delayFor(vcoDownHalf, fsv / 2) - 3);
+		vcoDelayLen = vcoDelayLenFull;
 		vcoDelayPos = 0;
 		hpC14.set(1 / (2 * kPi * 1e-6 * 50e3), fs);           // 3.2 Hz
 		hpC15.set(1 / (2 * kPi * 1e-6 * 98e3), fs);           // 1.6 Hz
 		hpC23.set(1 / (2 * kPi * 1e-6 * 12.2e3), fs);         // 13 Hz
 		hpOut.set(3.2, fs);
-		mufA1 = 1 - std::exp(-2 * kPi * 6e3 / fs);
-		mufA2 = 1 - std::exp(-2 * kPi * 3e3 / fs);
+
 		{
 			const double r1 = 220e3 + 2.2e3, r2 = 100e3 + 2.2e3, c = 10e-9;
 			vcaK1 = 1 / (r1 * (1 + h / (2 * r1 * c)));
 			vcaK2 = 1 / (r2 * (1 + h / (2 * r2 * c)));
 			vcaHc = h / c;
-			// Devil Fish: 32 Hz down 1 dB instead of 5: the VCA input couplings ~5x larger.
-			const double cdf = 47e-9;
-			vcaK1df = 1 / (r1 * (1 + h / (2 * r1 * cdf)));
-			vcaK2df = 1 / (r2 * (1 + h / (2 * r2 * cdf)));
-			vcaHcDf = h / cdf;
 		}
 		applyCalibration();
 	}
@@ -530,7 +553,7 @@ struct Voice::Impl {
 	void envModThevenin(double knob, double vMeg, double &vth, double &rth)
 	{
 		const double t = envModTaper(knob, cal.taperAMid, cal.taperAShape);
-		const double ra = (df ? 0.0 : 10e3) + 50e3 * t + 1;
+		const double ra = 10e3 + 50e3 * t + 1;
 		const double rb = 50e3 * (1 - t) + 1;
 		vth = nodeE + (vMeg - nodeE) * ra / (ra + rb);
 		rth = ra * rb / (ra + rb);
@@ -633,27 +656,10 @@ struct Voice::Impl {
 				gateInt = std::clamp((iC - iE31) * 10e3, 0.0, kV12 - 0.1);
 			}
 		}
-		if (df) {
-			// Devil Fish gate stage: notes start within 0.5 ms (no ~4 ms delay), non-accented
-			// ones rise with SOFT ATTACK (0.3-30 ms; accented 3 ms), and the release is a
-			// logarithmic fall from the moment the gate ends (the 303 holds ~8 ms, then falls
-			// linearly over ~8 ms).
-			const double top = kV12 - 0.1;
-			// SOFT ATTACK: 0.3 ms to 30 ms, about the 303's 3 ms at "2" (the manual's TB-303 setting).
-			const double sa = k.softAttack < 0.2 ? 0.3e-3 * std::pow(10.0, k.softAttack / 0.2)
-			                                     : 3e-3 * std::pow(10.0, (k.softAttack - 0.2) / 0.8);
-			const double tau = gateIn ? (accent ? 3e-3 : sa) : 3e-3;
-			gateDf += ((gateIn ? top : 0.0) - gateDf) * (1 - fastExp(-dt / tau));
-			gateInt = std::min(gateDf, std::max(0.0, top - iE31 * 10e3));
-		}
-
 		// --- MEG: C62 charged through D37 + R152 100R during the pulse, discharged through
 		// R138 68k + DECAY (1M A, shorted on accent) into the D28/D27/D26 string.
-		// Devil Fish: NORMAL and ACCENT DECAY pots, 30 ms to 3 s each, about the 303's ~200 ms
-		// near "2" to "2.7" (the manual's TB-303 settings). The 303's 68k gives 173 ms to 10 %;
-		// the time follows the resistance.
-		const double rDecay = df ? 68e3 * (30.0 / 173) * std::pow(100.0, std::pow(accent ? k.accentDecay : k.normalDecay, 0.6))
-		                         : 68e3 + (accent ? 0.0 : cal.decayPotOhms * decayTaper(k.decay, cal.decayTaperMid, cal.decayTaperShape));
+		// The 303's 68k gives 173 ms to 10 %; the time follows the resistance.
+		const double rDecay = 68e3 + (accent ? 0.0 : cal.decayPotOhms * decayTaper(k.decay, cal.decayTaperMid, cal.decayTaperShape));
 		const double c62F = cal.megCapUF * 1e-6;
 		oneShot = pulse > 0;
 		if (pulse > 0) {
@@ -683,8 +689,7 @@ struct Voice::Impl {
 		// --- Accent switch IC12-A into VR7 (50k B, pin 1 to ground). With the switch open the
 		// pot's top floats and the wiper sits on up to 50k to ground.
 		const double x7 = taperB(k.accent);
-		// Devil Fish ACCENT SWEEP at 0 opens this path: no MEG through ACCENT to filter or VCA.
-		const bool accOn = accent && !(df && k.accentSweep == 0);
+		const bool accOn = accent;
 		const double vth7 = accOn ? meg * x7 : 0.0;
 		const double rth7 = accOn ? 50e3 * x7 * (1 - x7) + 200 : 50e3 * x7 + 1;
 
@@ -694,11 +699,8 @@ struct Voice::Impl {
 		const double w = taperB(k.resonance);
 		const double r1w = cal.vr4bOhms * w + 10, rwc = cal.vr4bOhms * (1 - w) + 10;
 		const double gwc = 1 / rwc, g72 = 1 / 100e3;
-		// Devil Fish SWEEP SPEED: C13 (and R46) switched. Fast: a small C13 that each accent fills
-		// and empties; slow: a large one, charged harder, that takes longer to rise and to cool.
-		// (Values chosen for the behaviour the manual describes; the mod's schematic is unpublished.)
-		const double c13F = (df && k.sweepSpeed == 0 ? 0.22 : df && k.sweepSpeed == 2 ? 4.7 : 1.0) * cal.c13UF * 1e-6;
-		const double r46 = df && k.sweepSpeed == 2 ? 15e3 : 47e3;
+		const double c13F = cal.c13UF * 1e-6;
+		const double r46 = 47e3;
 		const double gcap = c13F / dt;
 		const double gc = gwc * gcap / (gwc + gcap);
 		const double v0 = (gc * c13 + g72 * vSum) / (gc + g72);
@@ -738,17 +740,9 @@ struct Voice::Impl {
 		sweepWiper = (iD24 + gc * c13 + g72 * vSum) / (gc + g72);
 		c13 += (sweepWiper - c13) * gc * dt / c13F;
 
-		// --- VEG: Q32 discharges C42, R123 1.5M recharges it, then Q31 and pin 1. Devil Fish:
-		// DECAY sets it: its first half the decay (16 ms to 3 s; R123's 1.5M gives the 303's
-		// ~3.5 s), its second half the level it settles at (none to full) with the long decay.
+		// --- VEG: Q32 discharges C42, R123 1.5M recharges it, then Q31 and pin 1.
 		vegTarget = kV12;
 		vegR = 1.5e6;
-		if (df) {
-			const double x = k.decay;
-			vegR = 1.5e6 / 3.5 * (x < 0.5 ? 0.016 * std::pow(3.0 / 0.016, x / 0.5) : 3.0);
-			if (x >= 0.5)
-				vegTarget = (1 - (x - 0.5) / 0.5) * (kV12 - 1.2);
-		}
 		stepVeg(dt);
 		solvePin1();
 		iAbcPrev = iAbcNow;
@@ -758,7 +752,7 @@ struct Voice::Impl {
 		// R71 2.2k to node E.
 		double vth5, rth5;
 		envModThevenin(k.envMod, meg, vth5, rth5);
-		const double r63 = df ? 73e3 : 220e3; // Devil Fish: three times the env mod
+		const double r63 = 220e3;
 		const double g5 = 1 / (rth5 + r63), g71 = 1 / 2.2e3;
 		vSum = (vth5 * g5 + sweepWiper * g72 + nodeE * g71) / (g5 + g72 + g71);
 		vR71 = vSum - nodeE;
@@ -766,14 +760,6 @@ struct Voice::Impl {
 		// Q11 saturates once its collector (R69 2.2k below Q12's emitters, ~4.7 V) nears node
 		// E: about 0.65 mA, ~40 kHz of cutoff. Soft-limit there.
 		double iRaw = ladderK * ladderCurrent(k.cutoff, vR71);
-		if (df) {
-			// CUT OFF about an octave further each way (max resonant ~5 kHz), then FILTER TRACKING:
-			// linear in volts to hertz, up to 2.7 kHz per volt, zero near 2 V (the low C).
-			iRaw *= std::exp2(2 * (k.cutoff - 0.5));
-			const double hzPerAmp = 0.692 / (2 * kVt * 33e-9) / (2 * kPi);
-			iRaw += k.filterTracking * std::sqrt(k.filterTracking) * 2.7e3 * (vCv - 2.0) / hzPerAmp;
-			iRaw = std::max(iRaw, 1e-9);
-		}
 		// Node E for the next step, from the currents Q9 sinks: the cutoff pot (R47) and I_E10,
 		// the env-mod pot (R61), R71 and the ladder current.
 		{
@@ -782,7 +768,7 @@ struct Voice::Impl {
 			const double iE10 = iRaw / fastExp(std::min(vR71 / kVt, 30.0));
 			const double iPot = iE10 + iRaw / 300;
 			const double i63 = (vth5 - vSum) / (rth5 + r63);
-			const double raE = (df ? 0.0 : 10e3) + 50e3 * envModTaper(k.envMod, cal.taperAMid, cal.taperAShape) + 1;
+			const double raE = 10e3 + 50e3 * envModTaper(k.envMod, cal.taperAMid, cal.taperAShape) + 1;
 			const double iE9 = (vth3 - iPot * rth3 - nodeE) / ra3 + iE10 + (vth5 - i63 * rth5 - nodeE) / raE +
 			                   (vSum - nodeE) / 2.2e3 + iRaw;
 			nodeE = nodeEFor(iE9);
@@ -817,8 +803,7 @@ struct Voice::Impl {
 		phase += dphi;
 		constexpr double jump = kSawTop - kSawBottom;
 		double held = sawHeld;
-		subOut = subHeld;
-		const double subLevelNow = subHigh ? subLevel : -subLevel;
+
 		if (phase >= 1) {
 			const double since = (phase - 1) * ramp;        // seconds since the ramp hit bottom
 			const double ta = std::min(since / hv, 1.0);    // fraction of a sample since the jump
@@ -826,14 +811,9 @@ struct Voice::Impl {
 			const double naive = kSawTop - jump * phase;
 			held += 0.5 * jump * ta * ta;
 			sawHeld = naive - 0.5 * jump * (1 - ta) * (1 - ta);
-			// TD-3-MO sub oscillator: a flip-flop on the reset, the same 2-point polyBLEP.
-			subHigh = !subHigh;
-			const double sj = (subHigh ? subLevel : -subLevel) - subLevelNow;
-			subOut += 0.5 * sj * ta * ta;
-			subHeld = subLevelNow + sj - 0.5 * sj * (1 - ta) * (1 - ta);
 		} else {
 			sawHeld = kSawTop - jump * phase;
-			subHeld = subLevelNow;
+
 		}
 		return held;
 	}
@@ -940,8 +920,8 @@ struct Voice::Impl {
 		const double a15 = hpC15.a(), b15 = hpC15.b();
 		const double a23 = hpC23.a(), b23 = hpC23.b();
 		constexpr double div = 2.2 / 12.2;
-		const double A = fbMul * div * a23 * loopFollower * a15 * resWiper * a14 * ampGain;
-		const double B = fbMul * div * (a23 * loopFollower * (a15 * resWiper * b14 + b15) + b23);
+		const double A = div * a23 * loopFollower * a15 * resWiper * a14 * ampGain;
+		const double B = div * (a23 * loopFollower * (a15 * resWiper * b14 + b15) + b23);
 		// Trapezoidal step, Newton on u1..u4, starting from a third-order Adams-Bashforth step
 		// (one iteration does for ~90 % of steps at 2x).
 		double un[4];
@@ -1225,10 +1205,10 @@ struct Voice::Impl {
 		// Two series R-C branches into R124 2.2k: VCF OUT via R121 220k + C21 10 nF, and the
 		// resonance wiper via R122 100k + C22 10 nF.
 		// Trapezoidal series RC: i = (v - vc)/r, vc' = i/c (vcaK1, vcaK2, vcaHc: setRates).
-		const double i1 = (vcfOut - c21) * (df ? vcaK1df : vcaK1);
-		const double i2 = (vcfWiper - c22) * (df ? vcaK2df : vcaK2);
-		c21 += (df ? vcaHcDf : vcaHc) * i1;
-		c22 += (df ? vcaHcDf : vcaHc) * i2;
+		const double i1 = (vcfOut - c21) * vcaK1;
+		const double i2 = (vcfWiper - c22) * vcaK2;
+		c21 += vcaHc * i1;
+		c22 += vcaHc * i2;
 		const double vin = 2.2e3 * (i1 + i2);
 		// BA662 (tools/spice/ba662.lib: the chip as reverse engineered from an original, with its
 		// clones' data sheets): a bipolar pair into Wilson mirrors, output current
@@ -1236,7 +1216,7 @@ struct Voice::Impl {
 		// R124/R125 and its emitter resistance attenuate the input more as I_ABC rises (-0.15 dB
 		// at 48 uA, -0.6 dB at 170 uA), and the output saturates at 98.5 % of I_ABC (SPICE).
 		const double vEff = vin / (1 + iAbc / 2.5e-3);
-		const double v = 0.985 * iAbc * double(tanh4(v4f{float(vEff / (2 * kVt)), 0, 0, 0})[0]) * 52.5e3; // float: ~-140 dB
+		const double v = 0.985 * iAbc * double(tanhRat(float(vEff / (2 * kVt)))) * 52.5e3; // float: ~-130 dB
 		// Swing about the ~5.3 V bias at pin 8: down to ~0.8 V, where the OTA's NPN mirror and
 		// the buffer's current sink saturate; up as far as the buffer's 10k pull-up from the rail
 		// can lift pin 8 against its load through C38 (VOLUME, R155 and the mixer): 4.7 V at full
@@ -1381,18 +1361,11 @@ void Voice::render(float *out, int n, float *s1, float *tp6)
 	v.tuneOct = (taperB(k.tuning) - 0.5) * 2 * v.cal.tuningRangeCents / 1200;
 	v.setVolume(k.volume);
 	const bool square = k.square;
-	const bool df = k.devilFish;
-	v.df = df;
-	v.fbMul = df && k.accentSweep < 2 ? 2.0 : 1.0;
-	// Slide: the DAC's 100k into C35 0.22 uF; the Devil Fish adds 3.3k and SLIDE TIME's 500k.
-	const double slideTau = df ? (103.3e3 + 500e3 * k.slideTime) * 0.22e-6 : 22e-3;
+	v.useVco(!square); // saw: the cheaper half-rate VCO path (Impl::kSawHalfRate)
+
+	// Slide: the DAC's 100k into C35 0.22 uF.
+	constexpr double slideTau = 22e-3;
 	const double slideStep = 1 - fastExp(-v.hv / slideTau);
-	const bool waveOff = df && k.waveOff;
-	v.subLevel = df ? v.subVolts(k.subOsc) : 0.0;
-	const double odGain = df ? std::pow(66.6, k.overdrive) : 1.0;
-	const double fmK = df ? k.filterFM * k.filterFM * 0.8 : 0.0; // per volt of VCA output, natural log
-	const int muf = df ? k.muffler : 0;
-	const double fmA = 2 * kPi * 5.0 / v.fs; // Filter FM's AC coupling
 	for (int s = 0; s < n; ++s) {
 		// Adaptive control rate: every host sample for m_fullMs after the CPU lines change
 		// (note start, accent, release: the gate conditioning, VCA and accent circuits move
@@ -1428,28 +1401,21 @@ void Voice::render(float *out, int n, float *s1, float *tp6)
 				else
 					v.vCv = v.vDac;
 				const double saw = v.sawStep();
-				if (square && !waveOff)
-					v.vcoBuf[o] = v.delayVco(float(v.squareStep(saw, true) + v.subOut));
+				if (square)
+					v.vcoBuf[o] = v.delayVco(float(v.squareStep(saw, true)));
 				else {
-					v.vcoBuf[o] = v.delayVco(float((waveOff ? kVref : saw) + v.subOut));
+					v.vcoBuf[o] = v.delayVco(float(saw));
 					if (j == 0 && o == 0)
 						v.squareStep(saw, false, v.vcoRatio * m_factor);
 				}
 			}
-			const double osc = v.vcoDown.process(v.vcoBuf);
+			const double osc = v.vcoDown->process(v.vcoBuf);
 			// Input network: R62 220k, C17 1 uF, R70 2.2k to the bias node.
 			const double i17 = (osc - kVref - v.c17) / 222.2e3;
 			v.c17 += v.h / 1e-6 * i17;
-			const double xIn = 2.2e3 * i17 * odGain;
-			// Devil Fish FILTER FM: the (muffled) VCA output, AC coupled into the summing node.
-			const double vcf = v.vcfStep(xIn, fmK != 0 ? iF * std::min(fastExp(fmK * v.fmSig), 400.0) : iF, k.resonance);
-			double vca = v.vcaStep(iAbc);
-			if (muf != 0)
-				vca = v.muffler(vca, muf);
-			if (df) {
-				v.fmHp += fmA * (vca - v.fmHp);
-				v.fmSig = vca - v.fmHp;
-			}
+			const double xIn = 2.2e3 * i17;
+			const double vcf = v.vcfStep(xIn, iF, k.resonance);
+			const double vca = v.vcaStep(iAbc);
 			const double o = v.outputStage(vca);
 			m_work[size_t(j)] = float(o / kFullScaleVolts);
 			if (j == m_factor - 1 && s1 != nullptr) {

@@ -1,4 +1,4 @@
-/* Model-303: the Lemus TB-303 voice (src/lemus, with the Devil Fish mods) as mpc-vst-plugins' mpc_engine()
+/* Model-303: the Lemus TB-303 voice (src/lemus) as mpc-vst-plugins' mpc_engine()
  * (wrapper/engine.h): 44.1 kHz, interleaved int16 stereo, 128-frame blocks.
  *
  * Parameters are kept in their own units (knobs 0-10, TUNE in cents, options by index) and turned into the voice's
@@ -92,20 +92,6 @@ struct Inst {
 		c.accent = val("accent") / 10;
 		c.volume = val("volume") / 10;
 		c.square = opt("waveform") == 1;
-		c.devilFish = opt("devil_fish") == 1;
-		c.softAttack = val("soft_attack") / 10;
-		c.normalDecay = val("normal_decay") / 10;
-		c.accentDecay = val("accent_decay") / 10;
-		c.filterTracking = val("filter_tracking") / 10;
-		c.overdrive = val("overdrive") / 10;
-		c.slideTime = val("slide_time") / 10;
-		c.filterFM = val("filter_fm") / 10;
-		c.sweepSpeed = opt("sweep_speed");
-		// the three-way switches' options run top to bottom as on the panel: 2, 1, 0 and HIGH, MID, LOW
-		c.accentSweep = 2 - opt("accent_sweep");
-		c.muffler = 2 - opt("muffler");
-		c.subOsc = opt("sub_osc") == 1 ? 3 - opt("sub_level") : 0;
-		c.waveOff = opt("vco") == 1;
 		for (auto &v : voices)
 			v.setControls(c);
 		sendLines();
